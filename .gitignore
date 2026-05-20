@@ -1,0 +1,16 @@
+.venv_pack/
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+*.log
+
+data/
+personnel.xlsx
+
+值班表/
+测试课表/
+人员名单/人员名单.xlsx
