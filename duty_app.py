@@ -5,6 +5,7 @@ import json
 import os
 import xlsxwriter
 from pathlib import Path
+from openpyxl import load_workbook
 from logic import (
     parse_filename_for_name, 
     parse_pdf_schedule, 
@@ -16,6 +17,8 @@ from logic import (
 
 # --- Configuration & Constants ---
 st.set_page_config(page_title="智能值班表排班系统", layout="wide", page_icon="📅")
+
+DUTY_TABLE_COLUMNS = ['Week', 'Day', 'Shift', 'Name', 'Class', 'Department', 'Role', 'Campus']
 
 
 def get_data_file():
@@ -76,7 +79,11 @@ def load_app_state():
         if "schedules" in payload:
             st.session_state["schedules"] = deserialize_schedules(payload["schedules"])
         if "duty_table" in payload:
-            st.session_state["duty_table"] = pd.DataFrame(payload["duty_table"])
+            duty_table = pd.DataFrame(payload["duty_table"])
+            for col in DUTY_TABLE_COLUMNS:
+                if col not in duty_table.columns:
+                    duty_table[col] = pd.Series(dtype="object")
+            st.session_state["duty_table"] = duty_table[DUTY_TABLE_COLUMNS]
     except Exception as e:
         st.warning(f"读取本机已保存数据失败：{e}")
 
@@ -85,6 +92,263 @@ def clear_saved_data_file():
     data_file = get_data_file()
     if data_file.exists():
         data_file.unlink()
+
+
+def get_default_export_dir():
+    export_dir = Path.cwd() / "值班表"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    return export_dir
+
+
+def sanitize_filename(filename):
+    cleaned = str(filename or "").strip()
+    for ch in '<>:"/\\|?*':
+        cleaned = cleaned.replace(ch, "_")
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        cleaned = "值班表.xlsx"
+    if not cleaned.lower().endswith(".xlsx"):
+        cleaned += ".xlsx"
+    return cleaned
+
+
+def default_duty_export_filename(duty_table):
+    weeks = sorted(
+        int(week)
+        for week in pd.Series(duty_table.get("Week", [])).dropna().unique()
+        if str(week).strip() != ""
+    )
+    if not weeks:
+        return "值班表.xlsx"
+    if len(weeks) == 1:
+        return f"第{weeks[0]}周值班表.xlsx"
+    return f"第{weeks[0]}-{weeks[-1]}周值班表.xlsx"
+
+
+def build_duty_export_df(duty_table):
+    return duty_table.rename(columns={
+        "Week": "周次",
+        "Day": "星期",
+        "Shift": "班次",
+        "Name": "姓名",
+        "Class": "班级",
+        "Department": "部门",
+        "Role": "职位",
+        "Campus": "校区",
+    })
+
+
+def build_duty_excel_bytes(export_df):
+    out_buffer = io.BytesIO()
+    with pd.ExcelWriter(out_buffer, engine="xlsxwriter") as writer:
+        export_df.to_excel(writer, index=False, sheet_name="值班表")
+        worksheet = writer.sheets["值班表"]
+        worksheet.freeze_panes(1, 0)
+        widths = [8, 12, 24, 12, 24, 18, 12, 12]
+        for idx, width in enumerate(widths[:len(export_df.columns)]):
+            worksheet.set_column(idx, idx, width)
+    return out_buffer.getvalue()
+
+
+PERSONNEL_COLUMN_MAP = {
+    "name": "Name",
+    "姓名": "Name",
+    "学生姓名": "Name",
+    "class": "Class",
+    "班级": "Class",
+    "专业班级": "Class",
+    "专业班": "Class",
+    "major": "Major",
+    "专业": "Major",
+    "grade": "Grade",
+    "年级": "Grade",
+    "department": "Department",
+    "部门": "Department",
+    "role": "Role",
+    "职位": "Role",
+    "职务": "Role",
+    "岗位": "Role",
+    "角色": "Role",
+    "campus": "Campus",
+    "校区": "Campus",
+    "序号": "Index",
+}
+
+
+def normalize_column_name(value):
+    if value is None:
+        return ""
+    return str(value).replace("\n", "").replace(" ", "").strip()
+
+
+def canonical_column_name(value):
+    key = normalize_column_name(value)
+    return PERSONNEL_COLUMN_MAP.get(key, PERSONNEL_COLUMN_MAP.get(key.lower(), key))
+
+
+def read_excel_with_merged_cells(file_obj):
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb.active
+    merged_values = {}
+
+    for merged_range in ws.merged_cells.ranges:
+        top_value = ws.cell(merged_range.min_row, merged_range.min_col).value
+        for row in range(merged_range.min_row, merged_range.max_row + 1):
+            for col in range(merged_range.min_col, merged_range.max_col + 1):
+                merged_values[(row, col)] = top_value
+
+    values = []
+    for row in range(1, ws.max_row + 1):
+        row_values = []
+        for col in range(1, ws.max_column + 1):
+            value = ws.cell(row, col).value
+            if value is None:
+                value = merged_values.get((row, col))
+            row_values.append(value)
+        values.append(row_values)
+
+    header_idx = None
+    for idx, row in enumerate(values):
+        mapped = [canonical_column_name(cell) for cell in row]
+        hits = sum(col in {"Name", "Class", "Grade", "Department", "Role", "Campus"} for col in mapped)
+        if "Name" in mapped and hits >= 2:
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        return pd.DataFrame(values)
+
+    columns = []
+    seen = {}
+    for idx, cell in enumerate(values[header_idx]):
+        col = canonical_column_name(cell) or f"Unnamed_{idx + 1}"
+        seen[col] = seen.get(col, 0) + 1
+        if seen[col] > 1:
+            col = f"{col}_{seen[col]}"
+        columns.append(col)
+
+    return pd.DataFrame(values[header_idx + 1:], columns=columns)
+
+
+def read_personnel_file(file_obj):
+    file_name = getattr(file_obj, "name", "").lower()
+    if file_name.endswith(".csv"):
+        return pd.read_csv(file_obj)
+    return read_excel_with_merged_cells(file_obj)
+
+
+def normalize_campus(value):
+    value = str(value).strip()
+    if "南" in value:
+        return CAMPUS_SOUTH
+    if "北" in value:
+        return CAMPUS_NORTH
+    return value
+
+
+def normalize_role(row):
+    role = str(row.get("Role", "")).strip()
+    department = str(row.get("Department", "")).strip()
+    role_text = f"{role} {department}"
+    if "主任团" in role_text:
+        return ROLE_DIRECTOR
+    if "副部" in role:
+        return ROLE_VICE_MINISTER
+    if "部长" in role:
+        return ROLE_MINISTER
+    if "干部" in role:
+        return ROLE_CADRE
+    if "干事" in role:
+        return ROLE_OFFICER
+    return role
+
+
+def normalize_personnel_dataframe(df_p):
+    df_p = df_p.copy()
+    df_p = df_p.rename(columns={col: canonical_column_name(col) for col in df_p.columns})
+
+    if "Name" in df_p.columns:
+        df_p["Name"] = df_p["Name"].fillna("").astype(str).str.strip()
+        df_p = df_p[df_p["Name"] != ""]
+
+    if "Class" not in df_p.columns:
+        if "Major" in df_p.columns and "Grade" in df_p.columns:
+            df_p["Class"] = (
+                df_p["Major"].fillna("").astype(str).str.strip()
+                + " "
+                + df_p["Grade"].fillna("").astype(str).str.strip()
+            ).str.strip()
+        elif "Major" in df_p.columns:
+            df_p["Class"] = df_p["Major"]
+        elif "Grade" in df_p.columns:
+            df_p["Class"] = df_p["Grade"]
+        else:
+            df_p["Class"] = ""
+
+    if "Department" not in df_p.columns:
+        df_p["Department"] = ""
+
+    for col in ["Class", "Grade", "Department", "Role", "Campus"]:
+        if col in df_p.columns:
+            df_p[col] = df_p[col].fillna("").astype(str).str.strip()
+
+    if "Department" in df_p.columns:
+        df_p["Department"] = df_p["Department"].replace("", pd.NA).ffill().fillna("")
+
+    if "Campus" in df_p.columns:
+        df_p["Campus"] = df_p["Campus"].apply(normalize_campus)
+    if "Role" in df_p.columns:
+        df_p["Role"] = df_p.apply(normalize_role, axis=1)
+
+    return df_p
+
+
+def build_personnel_template():
+    sample_data = pd.DataFrame({
+        "序号": [1, 2, 3, 4],
+        "姓名": ["张三", "李四", "王五", "赵六"],
+        "部门": ["办公室", "活动部", "宣传部", "主任团"],
+        "职务": ["干事", "干事", "干部", "干部"],
+        "专业班级": ["会计学2501", "法学2502", "计算机科学与技术2401", "公共事业管理2301"],
+        "年级": ["大一", "大一", "大二", "大三"],
+        "校区": ["旗山北校区", "旗山南校区", "旗山北校区", "旗山北校区"],
+    })
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        sample_data.to_excel(writer, index=False, sheet_name="人员名单")
+        worksheet = writer.sheets["人员名单"]
+        worksheet.freeze_panes(1, 0)
+        widths = [8, 12, 18, 12, 26, 10, 16]
+        for idx, width in enumerate(widths):
+            worksheet.set_column(idx, idx, width)
+    return buffer.getvalue()
+
+
+def unique_filter_options(series):
+    return sorted(
+        value
+        for value in series.fillna("").astype(str).str.strip().unique()
+        if value
+    )
+
+
+def person_select_label(name, personnel_df):
+    if name == "未安排":
+        return name
+    matches = personnel_df[personnel_df["Name"] == name]
+    if matches.empty:
+        return name
+
+    person = matches.iloc[0]
+    details = []
+    for col in ["Role", "Grade", "Department"]:
+        value = str(person.get(col, "")).strip()
+        if value:
+            details.append(value)
+
+    if not details:
+        return name
+    return f"{name}（{'，'.join(details)}）"
 
 
 if "app_state_loaded" not in st.session_state:
@@ -171,99 +435,16 @@ with tab1:
     with col1:
         st.subheader("1. 上传人员名单")
         st.markdown("请上传包含人员信息的 Excel 文件。")
-        st.info("表格必须包含以下列名：`Name` (姓名), `Class` (班级 - 专业+届别), `Department` (部门), `Role` (职位), `Campus` (校区)")
+        st.info("推荐表头：序号、姓名、部门、职务、专业班级、年级、校区。也兼容英文表头：Name、Class、Department、Role、Campus。")
         
         # Template
         if st.button("📥 下载Excel模板"):
-            sample_data = pd.DataFrame({
-                "Name": ["田宇", "张三", "李四"],
-                "Class": ["计算机2203", "软工2301", "通信2102"],
-                "Department": ["程序部", "办公室", "主任团"],
-                "Role": ["部长", "干事", "主任团"],
-                "Campus": ["南校区", "北校区", "南校区"]
-            })
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                sample_data.to_excel(writer, index=False)
-            st.download_button("点击下载模板.xlsx", buffer.getvalue(), "人员名单模板.xlsx")
+            st.download_button("点击下载模板.xlsx", build_personnel_template(), "人员名单模板.xlsx")
 
         p_file = st.file_uploader("点击上传人员名单 (Excel/CSV)", type=['xlsx', 'csv'])
         if p_file:
             try:
-                df_p = pd.read_excel(p_file) if p_file.name.endswith('.xlsx') else pd.read_csv(p_file)
-                
-                # 1. Column Mapping (Chinese -> English)
-                # This helps if user uploads a file with Chinese headers
-                col_map = {
-                    "姓名": "Name",
-                    "班级": "Class",
-                    "专业班级": "Class",
-                    "专业班": "Class",
-                    "专业": "Major",
-                    "年级": "Grade",
-                    "部门": "Department",
-                    "职位": "Role",
-                    "职务": "Role",
-                    "岗位": "Role",
-                    "角色": "Role",
-                    "校区": "Campus"
-                }
-                df_p = df_p.rename(columns=col_map)
-                
-                # Data Cleaning: Drop rows with missing Name and ensure string type
-                if 'Name' in df_p.columns:
-                    df_p = df_p.dropna(subset=['Name'])
-                    df_p['Name'] = df_p['Name'].astype(str).str.strip()
-                
-                # Compatibility: Rename Grade/Major to Class if needed
-                if 'Class' not in df_p.columns:
-                    if 'Major' in df_p.columns and 'Grade' in df_p.columns:
-                        df_p['Class'] = (
-                            df_p['Major'].fillna('').astype(str).str.strip()
-                            + " "
-                            + df_p['Grade'].fillna('').astype(str).str.strip()
-                        ).str.strip()
-                    elif 'Major' in df_p.columns:
-                        df_p['Class'] = df_p['Major']
-                    elif 'Grade' in df_p.columns:
-                        df_p['Class'] = df_p['Grade']
-                    else:
-                        df_p['Class'] = ''
-                        
-                if 'Department' not in df_p.columns: df_p['Department'] = ''
-
-                for col in ['Class', 'Department', 'Role', 'Campus']:
-                    if col in df_p.columns:
-                        df_p[col] = df_p[col].fillna('').astype(str).str.strip()
-
-                def normalize_campus(value):
-                    value = str(value).strip()
-                    if "南" in value:
-                        return CAMPUS_SOUTH
-                    if "北" in value:
-                        return CAMPUS_NORTH
-                    return value
-
-                def normalize_role(row):
-                    role = str(row.get('Role', '')).strip()
-                    department = str(row.get('Department', '')).strip()
-                    role_text = f"{role} {department}"
-                    if "主任团" in role_text:
-                        return ROLE_DIRECTOR
-                    if "副部" in role:
-                        return ROLE_VICE_MINISTER
-                    if "部长" in role:
-                        return ROLE_MINISTER
-                    if "干部" in role:
-                        return ROLE_CADRE
-                    if "干事" in role:
-                        return ROLE_OFFICER
-                    return role
-
-                if 'Campus' in df_p.columns:
-                    df_p['Campus'] = df_p['Campus'].apply(normalize_campus)
-                if 'Role' in df_p.columns:
-                    df_p['Role'] = df_p.apply(normalize_role, axis=1)
+                df_p = normalize_personnel_dataframe(read_personnel_file(p_file))
                 
                 # Keep only relevant columns if possible to avoid clutter, or just ensure existence
                 # We need Name, Class, Department, Role, Campus
@@ -277,11 +458,15 @@ with tab1:
                 if missing_cols:
                     st.error(f"❌ 上传的文件缺少关键列: {', '.join(missing_cols)}。请检查表头是否正确（支持中文：姓名、职务/职位、校区）。")
                 else:
-                    keep_cols = ['Name', 'Class', 'Department', 'Role', 'Campus']
+                    keep_cols = ['Name', 'Class', 'Grade', 'Department', 'Role', 'Campus']
+                    keep_cols = [col for col in keep_cols if col in df_p.columns]
                     df_p = df_p[keep_cols]
                     st.session_state['personnel'] = df_p
                     save_app_state()
                     st.success(f"✅ 成功导入 {len(df_p)} 名人员信息！")
+                    departments = unique_filter_options(df_p['Department'])
+                    if departments:
+                        st.info("已识别部门：" + "、".join(departments))
                     with st.expander("查看导入的人员列表"):
                         st.dataframe(df_p)
             except Exception as e:
@@ -398,11 +583,11 @@ with tab2:
         st.markdown("### 筛选条件")
         f_col1, f_col2, f_col3 = st.columns(3)
         with f_col1:
-            f_role = st.multiselect("按职位筛选", st.session_state['personnel']['Role'].unique())
+            f_role = st.multiselect("按职位筛选", unique_filter_options(st.session_state['personnel']['Role']))
         with f_col2:
-            f_campus = st.multiselect("按校区筛选", st.session_state['personnel']['Campus'].unique())
+            f_campus = st.multiselect("按校区筛选", unique_filter_options(st.session_state['personnel']['Campus']))
         with f_col3:
-            f_dept = st.multiselect("按部门筛选", st.session_state['personnel']['Department'].unique())
+            f_dept = st.multiselect("按部门筛选", unique_filter_options(st.session_state['personnel']['Department']))
             
         if st.button("🔎 开始查询"):
             results = []
@@ -443,13 +628,13 @@ with tab3:
     if 'personnel' in st.session_state and 'schedules' in st.session_state:
         # State for Duty Table
         if 'duty_table' not in st.session_state:
-            st.session_state['duty_table'] = pd.DataFrame(columns=['Week', 'Day', 'Shift', 'Name', 'Class', 'Department', 'Role', 'Campus'])
+            st.session_state['duty_table'] = pd.DataFrame(columns=DUTY_TABLE_COLUMNS)
             
         # Select Week
         sch_week = st.selectbox("正在制作第几周的班表？", target_weeks, key="sch_week")
         
         st.subheader(f"第 {sch_week} 周值班表预览与编辑")
-        st.info("👇 下方表格已根据所有规则（有课、通勤、职位限制）自动过滤了人员名单。直接选择即可。")
+        st.info("👇 下方表格已根据有课和通勤规则自动过滤人员；姓名后会显示职务、年级和部门，便于人工判断。")
         
         with st.form("scheduler_form"):
             changes = []
@@ -491,6 +676,7 @@ with tab3:
                             f"{shift_label}", 
                             candidates, 
                             index=candidates.index(current_name),
+                            format_func=lambda name: person_select_label(name, st.session_state['personnel']),
                             key=f"sel_{sch_week}_{day_i}_{shift_i}"
                         )
                         changes.append({
@@ -538,16 +724,29 @@ with tab3:
             
             with col_ex1:
                 st.markdown("**导出Excel文件**")
-                # Download
-                out_buffer = io.BytesIO()
-                with pd.ExcelWriter(out_buffer, engine='xlsxwriter') as writer:
-                    # Rename columns for better export
-                    export_df = st.session_state['duty_table'].rename(columns={
-                        "Week": "周次", "Day": "星期", "Shift": "班次", 
-                        "Name": "姓名", "Class": "班级", "Department": "部门", "Role": "职位", "Campus": "校区"
-                    })
-                    export_df.to_excel(writer, index=False)
-                st.download_button("📥 下载值班表.xlsx", out_buffer.getvalue(), "值班表.xlsx")
+                export_df = build_duty_export_df(st.session_state['duty_table'])
+                excel_bytes = build_duty_excel_bytes(export_df)
+                default_export_dir = get_default_export_dir()
+                default_export_name = default_duty_export_filename(st.session_state['duty_table'])
+
+                export_dir_text = st.text_input(
+                    "保存文件夹",
+                    value=str(default_export_dir),
+                    help="默认保存在当前项目的“值班表”文件夹，也可以填写其他本机文件夹路径。",
+                )
+                export_file_name = st.text_input("文件名", value=default_export_name)
+
+                if st.button("💾 保存到本地文件夹"):
+                    try:
+                        export_dir = Path(export_dir_text.strip().strip('"').strip("'")).expanduser()
+                        export_dir.mkdir(parents=True, exist_ok=True)
+                        export_path = export_dir / sanitize_filename(export_file_name)
+                        export_path.write_bytes(excel_bytes)
+                        st.success(f"已保存到：{export_path}")
+                    except Exception as e:
+                        st.error(f"保存失败：{e}")
+
+                st.download_button("📥 浏览器下载值班表.xlsx", excel_bytes, default_export_name)
                 
             with col_ex2:
                 st.markdown("**导入已有排班进行修改**")

@@ -56,7 +56,10 @@ def pause_console(message):
     print(message)
     print()
     if sys.stdin and sys.stdin.isatty():
-        input("Press Enter to close this window...")
+        try:
+            input("Press Enter to close this window...")
+        except EOFError:
+            pass
 
 def main():
     import streamlit.web.cli as stcli
@@ -67,7 +70,16 @@ def main():
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     if os.environ.get("DUTY_SCHEDULER_IMPORT_CHECK") == "1":
-        import duty_app  # noqa: F401
+        import logic  # noqa: F401
+        import openpyxl  # noqa: F401
+        import pandas  # noqa: F401
+        import pdfplumber  # noqa: F401
+        import streamlit  # noqa: F401
+        import xlsxwriter  # noqa: F401
+
+        app_file = Path(resolve_path("duty_app.py"))
+        if not app_file.exists():
+            raise FileNotFoundError(f"Missing app entry: {app_file}")
         print("IMPORT_CHECK_OK", flush=True)
         return 0
 
@@ -100,7 +112,8 @@ if __name__ == "__main__":
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         if code in (None, 0):
-            pause_console("Duty Scheduler has exited.")
+            if os.environ.get("DUTY_SCHEDULER_IMPORT_CHECK") != "1":
+                pause_console("Duty Scheduler has exited.")
             raise
 
         details = f"SystemExit: {exc.code}\n\n{traceback.format_exc()}"

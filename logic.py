@@ -13,8 +13,6 @@ ROLE_MINISTER = "部长"
 ROLE_VICE_MINISTER = "副部长"
 ROLE_DIRECTOR = "主任团"
 
-ALLOWED_LATE_SHIFT_ROLES = [ROLE_CADRE, ROLE_MINISTER, ROLE_VICE_MINISTER, ROLE_DIRECTOR]
-
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAYS_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -164,7 +162,6 @@ def check_availability(person, week, day_idx, shift_name, all_schedules):
     Returns: (is_available, reason_code, debug_info)
     """
     name = person['Name']
-    role = person['Role']
     person_campus = person['Campus']
     
     # Check if schedule exists for this person
@@ -176,18 +173,13 @@ def check_availability(person, week, day_idx, shift_name, all_schedules):
     shift_conf = SHIFTS[shift_name]
     shift_periods = shift_conf['periods']
     
-    # 1. Check Role
-    if shift_conf['type'] == "afternoon2":
-        if role not in ALLOWED_LATE_SHIFT_ROLES:
-            return False, "ROLE", f"Role '{role}' not allowed for late shift"
-
-    # 2. Check Direct Conflicts
+    # 1. Check Direct Conflicts
     for slot in schedule:
         if slot['day'] == day_idx and slot['period'] in shift_periods:
             if week in slot['weeks']:
                 return False, "CLASS", f"Class at Period {slot['period']}"
 
-    # 3. Check Commute
+    # 2. Check Commute
     if person_campus == CAMPUS_SOUTH and shift_conf['type'] == "afternoon1":
         next_periods = shift_conf['next_periods']
         for slot in schedule:
