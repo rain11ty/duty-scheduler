@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('duty_app.py', '.'), ('logic.py', '.')]
-hiddenimports = ['streamlit.web.cli', 'streamlit.runtime.scriptrunner.magic_funcs', 'numpy._core._exceptions', 'openpyxl', 'xlsxwriter', 'pdfplumber']
+hiddenimports = ['streamlit.web.cli', 'streamlit.runtime.scriptrunner.magic_funcs', 'numpy._core._exceptions', 'openpyxl', 'xlsxwriter', 'pdfplumber', 'tkinter', 'tkinter.filedialog']
 datas += collect_data_files('streamlit')
 datas += collect_data_files('altair')
 datas += copy_metadata('streamlit')
