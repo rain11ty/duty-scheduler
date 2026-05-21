@@ -3,6 +3,7 @@ import pandas as pd
 import io
 import json
 import os
+import re
 import xlsxwriter
 from pathlib import Path
 from openpyxl import load_workbook
@@ -19,6 +20,205 @@ from logic import (
 st.set_page_config(page_title="智能值班表排班系统", layout="wide", page_icon="📅")
 
 DUTY_TABLE_COLUMNS = ['Week', 'Day', 'Shift', 'Name', 'Class', 'Department', 'Role', 'Campus']
+DUTY_IMPORT_COLUMN_MAP = {
+    "周次": "Week",
+    "星期": "Day",
+    "班次": "Shift",
+    "姓名": "Name",
+    "班级": "Class",
+    "专业班级": "Class",
+    "部门": "Department",
+    "职位": "Role",
+    "职务": "Role",
+    "校区": "Campus",
+}
+
+
+def normalize_week_values(value):
+    if value is None:
+        return set()
+
+    if isinstance(value, str):
+        return {int(item) for item in re.findall(r"\d+", value)}
+
+    try:
+        return {int(item) for item in value}
+    except TypeError:
+        try:
+            return {int(value)}
+        except (TypeError, ValueError):
+            return set()
+
+
+def normalize_week_number(value):
+    if value is None or pd.isna(value):
+        return None
+
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+    return int(match.group())
+
+
+def normalize_duty_table_dataframe(df):
+    df = df.copy()
+    df = df.rename(columns={col: DUTY_IMPORT_COLUMN_MAP.get(str(col).strip(), col) for col in df.columns})
+
+    for col in DUTY_TABLE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[DUTY_TABLE_COLUMNS].copy()
+    df["Week"] = df["Week"].apply(normalize_week_number)
+    df = df[df["Week"].notna()]
+    df["Week"] = df["Week"].astype(int)
+
+    for col in ["Day", "Shift", "Name", "Class", "Department", "Role", "Campus"]:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    df = df[(df["Name"] != "") & (df["Name"] != "未安排")]
+    return df
+
+
+def get_duty_weeks(duty_table):
+    if duty_table is None or duty_table.empty or "Week" not in duty_table.columns:
+        return set()
+
+    weeks = duty_table["Week"].apply(normalize_week_number).dropna()
+    return {int(week) for week in weeks}
+
+
+def fill_duty_details_from_personnel(duty_table):
+    if "personnel" not in st.session_state:
+        return duty_table
+
+    personnel = st.session_state["personnel"]
+    if personnel.empty or "Name" not in personnel.columns:
+        return duty_table
+
+    detail_cols = ["Class", "Department", "Role", "Campus"]
+    personnel_details = personnel.drop_duplicates("Name").set_index("Name")
+    duty_table = duty_table.copy()
+
+    for col in detail_cols:
+        if col not in personnel_details.columns:
+            continue
+        missing = duty_table[col].fillna("").astype(str).str.strip() == ""
+        duty_table.loc[missing, col] = duty_table.loc[missing, "Name"].map(personnel_details[col]).fillna("")
+
+    return duty_table
+
+
+def merge_imported_duty_table(import_df, replace_weeks=None):
+    current = st.session_state.get("duty_table", pd.DataFrame(columns=DUTY_TABLE_COLUMNS))
+    current = normalize_duty_table_dataframe(current)
+    import_df = fill_duty_details_from_personnel(import_df)
+    replace_weeks = set(replace_weeks or [])
+
+    if replace_weeks:
+        current = current[~current["Week"].isin(replace_weeks)]
+
+    merged = pd.concat([current, import_df], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Week", "Day", "Shift"], keep="last")
+    st.session_state["duty_table"] = merged[DUTY_TABLE_COLUMNS]
+    save_app_state()
+
+
+def reset_duty_import_widget(message):
+    st.session_state["duty_import_message"] = message
+    st.session_state["duty_import_uploader_version"] = st.session_state.get("duty_import_uploader_version", 0) + 1
+    st.rerun()
+
+
+def render_duty_import_export_section():
+    st.divider()
+    st.subheader("📤 导出/导入")
+
+    if "duty_import_uploader_version" not in st.session_state:
+        st.session_state["duty_import_uploader_version"] = 0
+
+    if st.session_state.get("duty_import_message"):
+        st.success(st.session_state.pop("duty_import_message"))
+
+    col_ex1, col_ex2 = st.columns(2)
+
+    with col_ex1:
+        st.markdown("**导出Excel文件**")
+        if st.session_state['duty_table'].empty:
+            st.info("暂无已保存排班，保存后可导出 Excel。")
+        else:
+            export_df = build_duty_export_df(st.session_state['duty_table'])
+            excel_bytes = build_duty_excel_bytes(export_df)
+            default_export_name = default_duty_export_filename(st.session_state['duty_table'])
+
+            if st.button("💾 选择位置并保存"):
+                try:
+                    export_path = choose_excel_save_path(default_export_name)
+                    if export_path:
+                        export_path.parent.mkdir(parents=True, exist_ok=True)
+                        export_path.write_bytes(excel_bytes)
+                        st.success(f"已保存到：{export_path}")
+                    else:
+                        st.info("已取消保存。")
+                except Exception as e:
+                    st.error(f"保存失败：{e}")
+
+            st.download_button("📥 浏览器下载值班表.xlsx", excel_bytes, default_export_name)
+
+    with col_ex2:
+        st.markdown("**导入已有排班进行修改**")
+        up_sched = st.file_uploader(
+            "上传之前导出的值班表Excel",
+            type=['xlsx'],
+            key=f"duty_import_{st.session_state['duty_import_uploader_version']}",
+        )
+        if up_sched:
+            try:
+                imp_df = normalize_duty_table_dataframe(pd.read_excel(up_sched))
+                import_weeks = get_duty_weeks(imp_df)
+                existing_weeks = get_duty_weeks(st.session_state['duty_table'])
+                conflict_weeks = sorted(import_weeks & existing_weeks)
+                new_weeks = sorted(import_weeks - existing_weeks)
+
+                if imp_df.empty or not import_weeks:
+                    st.warning("导入文件中没有识别到有效排班记录，请检查表头和周次。")
+                else:
+                    st.write(f"导入文件包含周次：{', '.join(map(str, sorted(import_weeks)))}")
+
+                    if conflict_weeks:
+                        st.warning(
+                            "系统中已存在这些周次的值班表："
+                            + "、".join(map(str, conflict_weeks))
+                            + "。请选择如何处理。"
+                        )
+                        replace_col, skip_col = st.columns(2)
+                        with replace_col:
+                            if st.button("替换已有周次并导入"):
+                                merge_imported_duty_table(imp_df, replace_weeks=conflict_weeks)
+                                reset_duty_import_widget(
+                                    f"已导入 {len(imp_df)} 条记录，并替换第 "
+                                    + "、".join(map(str, conflict_weeks))
+                                    + " 周的原有值班表。"
+                                )
+                        with skip_col:
+                            if new_weeks:
+                                if st.button("只导入新周次"):
+                                    new_df = imp_df[imp_df["Week"].isin(new_weeks)]
+                                    merge_imported_duty_table(new_df)
+                                    reset_duty_import_widget(
+                                        f"已导入第 {'、'.join(map(str, new_weeks))} 周，已跳过冲突周次。"
+                                    )
+                            else:
+                                st.info("导入文件全部周次都已存在，如需更新请使用替换导入。")
+                    else:
+                        merge_imported_duty_table(imp_df)
+                        reset_duty_import_widget(
+                            f"导入成功，共导入 {len(imp_df)} 条记录，周次："
+                            + "、".join(map(str, sorted(import_weeks)))
+                            + "。"
+                        )
+            except Exception as e:
+                st.error(f"导入失败: {e}")
 
 
 def get_data_file():
@@ -37,7 +237,7 @@ def serialize_schedules(schedules):
         serializable[name] = []
         for slot in slots:
             item = dict(slot)
-            item["weeks"] = sorted(list(item.get("weeks", [])))
+            item["weeks"] = sorted(normalize_week_values(item.get("weeks", [])))
             serializable[name].append(item)
     return serializable
 
@@ -48,7 +248,7 @@ def deserialize_schedules(schedules):
         restored[name] = []
         for slot in slots:
             item = dict(slot)
-            item["weeks"] = set(item.get("weeks", []))
+            item["weeks"] = normalize_week_values(item.get("weeks", []))
             restored[name].append(item)
     return restored
 
@@ -376,6 +576,29 @@ def person_select_label(name, personnel_df):
     return f"{name}（{'，'.join(details)}）"
 
 
+def resolve_schedule_owner_name(file_name):
+    fallback_name = parse_filename_for_name(file_name)
+
+    personnel = st.session_state.get("personnel")
+    if personnel is None or "Name" not in personnel.columns:
+        return fallback_name
+
+    names = (
+        personnel["Name"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .loc[lambda s: s != ""]
+        .drop_duplicates()
+        .tolist()
+    )
+    matched_names = [name for name in names if name in file_name]
+    if not matched_names:
+        return fallback_name
+
+    return sorted(matched_names, key=len, reverse=True)[0]
+
+
 if "app_state_loaded" not in st.session_state:
     load_app_state()
     st.session_state["app_state_loaded"] = True
@@ -393,7 +616,7 @@ def parse_schedule_files(schedule_files):
         display_name = Path(file_name).name
         try:
             status_text.text(f"正在处理: {display_name}...")
-            name = parse_filename_for_name(display_name)
+            name = resolve_schedule_owner_name(display_name)
             slots = parse_pdf_schedule(f)
             parsed[name] = slots
             logs.append(f"✅ {name}: 成功提取 {len(slots)} 个课程时间段")
@@ -739,54 +962,12 @@ with tab3:
                 st.session_state['duty_table'] = pd.concat([base_df, pd.DataFrame(new_rows)], ignore_index=True)
                 save_app_state()
                 st.success("✅ 保存成功！")
-                
-        # Export
-        if not st.session_state['duty_table'].empty:
-            st.divider()
-            st.subheader("📤 导出/导入")
-            
-            col_ex1, col_ex2 = st.columns(2)
-            
-            with col_ex1:
-                st.markdown("**导出Excel文件**")
-                export_df = build_duty_export_df(st.session_state['duty_table'])
-                excel_bytes = build_duty_excel_bytes(export_df)
-                default_export_name = default_duty_export_filename(st.session_state['duty_table'])
+    else:
+        st.info("请先在「数据导入」页面上传人员名单和课表后再手动制作排班。也可以先在下方导入已有值班表查看统计。")
 
-                if st.button("💾 选择位置并保存"):
-                    try:
-                        export_path = choose_excel_save_path(default_export_name)
-                        if export_path:
-                            export_path.parent.mkdir(parents=True, exist_ok=True)
-                            export_path.write_bytes(excel_bytes)
-                            st.success(f"已保存到：{export_path}")
-                        else:
-                            st.info("已取消保存。")
-                    except Exception as e:
-                        st.error(f"保存失败：{e}")
-
-                st.download_button("📥 浏览器下载值班表.xlsx", excel_bytes, default_export_name)
-                
-            with col_ex2:
-                st.markdown("**导入已有排班进行修改**")
-                up_sched = st.file_uploader("上传之前导出的值班表Excel", type=['xlsx'])
-                if up_sched:
-                    if st.button("📥 合并导入"):
-                        try:
-                            imp_df = pd.read_excel(up_sched)
-                            # Map back if needed or assume format is same (need to be careful with column names)
-                            # If we exported with Chinese headers, we need to map back to English for internal state
-                            if "周次" in imp_df.columns:
-                                imp_df = imp_df.rename(columns={
-                                    "周次": "Week", "星期": "Day", "班次": "Shift", 
-                                    "姓名": "Name", "班级": "Class", "部门": "Department", "职位": "Role", "校区": "Campus"
-                                })
-                            
-                            st.session_state['duty_table'] = pd.concat([st.session_state['duty_table'], imp_df]).drop_duplicates()
-                            save_app_state()
-                            st.success("✅ 导入成功！")
-                        except Exception as e:
-                            st.error(f"导入失败: {e}")
+    if 'duty_table' not in st.session_state:
+        st.session_state['duty_table'] = pd.DataFrame(columns=DUTY_TABLE_COLUMNS)
+    render_duty_import_export_section()
 
 # --- Tab 4: Records ---
 with tab4:
