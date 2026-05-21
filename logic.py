@@ -34,6 +34,119 @@ SHIFTS = {
     }
 }
 
+ALL_PERIODS = list(range(1, 12))
+DAY_TO_INDEX = {day: index for index, day in enumerate(DAYS_CN)}
+
+
+def parse_practice_weeks_from_text(text):
+    if not text:
+        return set()
+
+    normalized = (
+        str(text)
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ",")
+        .replace("、", ",")
+        .replace("\n", "")
+    )
+
+    weeks = set()
+    # Practice rows usually look like: 课程名(共2周)/18-19周/无;
+    # Only parse the slash-delimited week field, not "(共2周)".
+    for segment in re.findall(r'/([^/;]*周[^/;]*)/', normalized):
+        weeks.update(parse_weeks_from_text(segment))
+    return weeks
+
+
+def add_practice_week_slots(busy_slots, text):
+    if not text or "实践课程" not in text:
+        return
+
+    normalized = (
+        str(text)
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ",")
+        .replace("\n", "")
+    )
+
+    for match in re.finditer(r'实践课程[:：](.*?)(?:其他课程[:：]|打印时间|$)', normalized):
+        practice_text = match.group(1).strip()
+        weeks = parse_practice_weeks_from_text(practice_text)
+        if not weeks:
+            continue
+
+        for day_idx in range(len(DAYS_CN)):
+            for period in ALL_PERIODS:
+                busy_slots.append({
+                    'day': day_idx,
+                    'period': period,
+                    'weeks': weeks,
+                    'campus': CAMPUS_NORTH,
+                    'raw': f"实践课程：{practice_text}",
+                    'type': 'practice'
+                })
+
+
+def parse_period_range(value):
+    match = re.fullmatch(r'\s*(\d{1,2})\s*[-－—]\s*(\d{1,2})\s*', str(value or ""))
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    if start > end:
+        start, end = end, start
+    return list(range(start, end + 1))
+
+
+def parse_list_schedule_table(table):
+    busy_slots = []
+    if not table:
+        return busy_slots
+
+    current_day = None
+    current_periods = None
+
+    for row in table:
+        cells = [(str(cell).strip() if cell is not None else "") for cell in row]
+        if len(cells) < 3:
+            continue
+
+        day_text, period_text, content = cells[0], cells[1], cells[2]
+        if day_text in DAY_TO_INDEX:
+            current_day = DAY_TO_INDEX[day_text]
+
+        parsed_periods = parse_period_range(period_text)
+        if parsed_periods:
+            current_periods = parsed_periods
+
+        if current_day is None or not current_periods:
+            continue
+        if not content or "周数" not in content:
+            continue
+
+        weeks = parse_weeks_from_text(content)
+        if not weeks:
+            continue
+
+        campus = CAMPUS_NORTH
+        if "南校区" in content:
+            campus = CAMPUS_SOUTH
+        elif "北校区" in content:
+            campus = CAMPUS_NORTH
+
+        for period in current_periods:
+            busy_slots.append({
+                'day': current_day,
+                'period': period,
+                'weeks': weeks,
+                'campus': campus,
+                'raw': content,
+                'type': 'class'
+            })
+
+    return busy_slots
+
 def parse_filename_for_name(filename):
     """Extracts student name from filename like '张三(2023-2024-2)课表.pdf'"""
     base = os.path.basename(filename)
@@ -97,64 +210,10 @@ def parse_pdf_schedule(pdf_file):
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
+            add_practice_week_slots(busy_slots, page.extract_text() or "")
             tables = page.extract_tables()
             for table in tables:
-                if not table or len(table) < 3: continue
-                
-                header_row = table[1]
-                day_map = {}
-                for idx, col in enumerate(header_row):
-                    if col:
-                        c = col.replace('\n', '').strip()
-                        if "星期一" in c: day_map[0] = idx
-                        elif "星期二" in c: day_map[1] = idx
-                        elif "星期三" in c: day_map[2] = idx
-                        elif "星期四" in c: day_map[3] = idx
-                        elif "星期五" in c: day_map[4] = idx
-                        elif "星期六" in c: day_map[5] = idx
-                        elif "星期日" in c: day_map[6] = idx
-                
-                if not day_map: continue
-                
-                for r_idx in range(2, len(table)):
-                    row = table[r_idx]
-                    period_val = row[1]
-                    if period_val is None: continue
-                    
-                    try:
-                        p_str = str(period_val).strip()
-                        if not p_str.isdigit(): continue
-                        period_num = int(p_str)
-                    except:
-                        continue
-                        
-                    for day_idx, col_idx in day_map.items():
-                        if col_idx < len(row):
-                            content = row[col_idx]
-                            if content and len(content.strip()) > 2:
-                                content = content.strip()
-                                weeks = parse_weeks_from_text(content)
-                                
-                                campus = CAMPUS_NORTH 
-                                if "南校区" in content:
-                                    campus = CAMPUS_SOUTH
-                                elif "北校区" in content:
-                                    campus = CAMPUS_NORTH
-                                
-                                covered_periods = [period_num]
-                                p_match = re.search(r'\((\d+)-(\d+)节\)', content)
-                                if p_match:
-                                    s, e = int(p_match.group(1)), int(p_match.group(2))
-                                    covered_periods = list(range(s, e+1))
-                                
-                                for p in covered_periods:
-                                    busy_slots.append({
-                                        'day': day_idx,
-                                        'period': p,
-                                        'weeks': weeks,
-                                        'campus': campus,
-                                        'raw': content
-                                    })
+                busy_slots.extend(parse_list_schedule_table(table))
     return busy_slots
 
 def check_availability(person, week, day_idx, shift_name, all_schedules):
@@ -177,6 +236,8 @@ def check_availability(person, week, day_idx, shift_name, all_schedules):
     for slot in schedule:
         if slot['day'] == day_idx and slot['period'] in shift_periods:
             if week in slot['weeks']:
+                if slot.get('type') == 'practice':
+                    return False, "PRACTICE", "Practice course week"
                 return False, "CLASS", f"Class at Period {slot['period']}"
 
     # 2. Check Commute

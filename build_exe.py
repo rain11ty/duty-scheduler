@@ -70,6 +70,8 @@ if __name__ == "__main__":
         "--hidden-import=openpyxl",
         "--hidden-import=xlsxwriter",
         "--hidden-import=pdfplumber",
+        "--hidden-import=tkinter",
+        "--hidden-import=tkinter.filedialog",
         "--exclude-module=torch",
         "--exclude-module=tensorflow",
         "--exclude-module=scipy",

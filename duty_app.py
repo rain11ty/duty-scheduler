@@ -150,6 +150,31 @@ def build_duty_excel_bytes(export_df):
     return out_buffer.getvalue()
 
 
+def choose_excel_save_path(default_filename):
+    import tkinter as tk
+    from tkinter import filedialog
+
+    default_dir = get_default_export_dir()
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        selected = filedialog.asksaveasfilename(
+            parent=root,
+            title="保存值班表",
+            initialdir=str(default_dir),
+            initialfile=sanitize_filename(default_filename),
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")],
+        )
+    finally:
+        root.destroy()
+
+    if not selected:
+        return None
+    return Path(selected)
+
+
 PERSONNEL_COLUMN_MAP = {
     "name": "Name",
     "姓名": "Name",
@@ -726,23 +751,17 @@ with tab3:
                 st.markdown("**导出Excel文件**")
                 export_df = build_duty_export_df(st.session_state['duty_table'])
                 excel_bytes = build_duty_excel_bytes(export_df)
-                default_export_dir = get_default_export_dir()
                 default_export_name = default_duty_export_filename(st.session_state['duty_table'])
 
-                export_dir_text = st.text_input(
-                    "保存文件夹",
-                    value=str(default_export_dir),
-                    help="默认保存在当前项目的“值班表”文件夹，也可以填写其他本机文件夹路径。",
-                )
-                export_file_name = st.text_input("文件名", value=default_export_name)
-
-                if st.button("💾 保存到本地文件夹"):
+                if st.button("💾 选择位置并保存"):
                     try:
-                        export_dir = Path(export_dir_text.strip().strip('"').strip("'")).expanduser()
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        export_path = export_dir / sanitize_filename(export_file_name)
-                        export_path.write_bytes(excel_bytes)
-                        st.success(f"已保存到：{export_path}")
+                        export_path = choose_excel_save_path(default_export_name)
+                        if export_path:
+                            export_path.parent.mkdir(parents=True, exist_ok=True)
+                            export_path.write_bytes(excel_bytes)
+                            st.success(f"已保存到：{export_path}")
+                        else:
+                            st.info("已取消保存。")
                     except Exception as e:
                         st.error(f"保存失败：{e}")
 
