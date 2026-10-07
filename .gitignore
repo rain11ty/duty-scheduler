@@ -1,0 +1,26 @@
+.venv_pack/
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+*.log
+~$*.xlsx
+
+data/
+personnel.xlsx
+
+值班表/
+测试课表/
+人员名单/人员名单.xlsx
+
+# 本机业务文件；只允许提交经过检查的虚构名单模板。
+*.pdf
+*.csv
+*.xlsx
+!人员名单/人员名单模板.xlsx
+
+tmp/
+output/playwright/
